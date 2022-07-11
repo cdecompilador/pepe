@@ -6,13 +6,97 @@ use crossterm::{QueueableCommand, execute, terminal};
 use crossterm::style::{Print, PrintStyledContent, Color, Stylize, Attribute};
 use crossterm::event::*;
 
+/// Wrapper around Result
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Represents the position of a cursor on a file or the terminal screen
+/// Represents the cursor on the terminal screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Position {
+struct Cursor {
     column: usize,
     row: usize
+}
+
+impl Cursor {
+    /// Adjust the column when a vertical movement issued to the proper column.
+    ///
+    /// Cases:
+    ///     - When the last line column was the first/last one, this will 
+    ///       adjust the column of the cursor to the first/last line of the 
+    ///       current line
+    ///     - Take into account also the last padding, so if the whitespaces
+    ///       on the left incrase the column is incrased by that incrase
+    ///       ammount
+    fn adjust_column_vertical(
+        &mut self,
+        doc: &Document,
+        modifiers: KeyModifiers,
+        scroll_y: &mut usize,
+        last_column: &mut bool,
+        last_padding: &mut usize
+    ) {
+        // Get a reference to the line the cursor is at on the document
+        let curr_line = 
+            &doc.inner_lines[*scroll_y + self.row];
+
+        // Update the padding
+        let mut curr_padding = 0;
+        while curr_padding < curr_line.len() 
+                && curr_line
+                    .as_bytes()[curr_padding]
+                    .is_ascii_whitespace() {
+            curr_padding += 1;
+        }
+        let padding = curr_padding as i32 - *last_padding as i32;
+
+        // If control pressed, just go forward without padding calculations
+        let new_column;
+        if !modifiers.contains(KeyModifiers::CONTROL) {
+            new_column = (self.column as i32 + padding)
+                .try_into().unwrap_or(0);
+        } else {
+            new_column = self.column;
+        }
+
+        *last_padding = curr_padding;
+
+        // Update the cursor position knowning that, also handling the case 
+        // that the last movement was on last line, so this will also be on the 
+        // last line
+        let max_col = curr_line.len().checked_sub(1).unwrap_or(0);
+        if *last_column {
+            self.column = max_col;
+        } else {
+            self.column = usize::min(max_col, new_column);
+        }
+    }
+    fn adjust_column_random(
+        &mut self,
+        doc: &Document,
+        scroll_y: &usize,
+        last_column: &mut bool,
+        last_padding: &mut usize
+    ) {
+        // Get a reference to the line the cursor is at on the document
+        let curr_line = 
+            &doc.inner_lines[*scroll_y + self.row];
+
+        // Update the padding
+        let mut curr_padding = 0;
+        while curr_padding < curr_line.len() 
+                && curr_line
+                    .as_bytes()[curr_padding]
+                    .is_ascii_whitespace() {
+            curr_padding += 1;
+        }
+        *last_padding = curr_padding;
+
+        // Update the `last_column` and the column if exceeds the line width
+        let max_col = curr_line.len().checked_sub(1).unwrap_or(0);
+        if max_col <= self.column {
+            *last_column = true;
+            self.column = max_col;
+        }
+    }
 }
 
 /// A document the editor opens for read and (probably) write.
@@ -101,7 +185,7 @@ impl Document {
 fn refresh_screen(
     stdout: &mut Stdout,
     document: &Option<Document>,
-    cursor: &Position,
+    cursor: &Cursor,
     scroll_y: usize,
 ) -> Result<()> {
     // Hide the cursor
@@ -132,7 +216,7 @@ fn refresh_screen(
         } else {
             // Print the intro (no document opened)
             if row == rows / 3 {
-                let msg = "Hecto editor -- version 0.0.1"
+                let msg = "Pepe editor -- version 0.0.1"
                     .with(Color::Blue);
                 assert!(columns / 2 >= msg.content().len() as u16 / 2);
                 let msg_start = columns / 2 - msg.content().len() as u16 / 2;
@@ -185,7 +269,7 @@ fn refresh_screen(
         crossterm::cursor::MoveToNextLine(1),
         PrintStyledContent(status_msg
             .with(Color::Black)
-            .on(Color::White)));
+            .on(Color::White)))?;
 
     // Show again the cursor
     execute!(stdout, 
@@ -198,8 +282,9 @@ fn refresh_screen(
 // TODO: Use async like a real castellanoleonés
 fn process_keypress(
     running: &mut bool, 
-    cursor: &mut Position,
+    cursor: &mut Cursor,
     last_column: &mut bool,
+    last_padding: &mut usize,
     scroll_y: &mut usize,
     doc: &mut Option<Document>,
 ) -> Result<()> {
@@ -227,8 +312,11 @@ fn process_keypress(
                     }) => {
                         // Shift + Up: Go up by an entire page
                         if modifiers.contains(KeyModifiers::SHIFT) {
+                            // Normal page up
                             if scroll_y.checked_sub(rows).is_some() {
                                 *scroll_y -= rows;
+                            // Special case you only can get to the top of 
+                            // the terminal
                             } else {
                                 *scroll_y = 0;
                                 cursor.row = 0;
@@ -236,33 +324,28 @@ fn process_keypress(
                         // Normal Up: go to previous line, to the same column 
                         // or closest to end of line
                         } else {
+                            // Special case cursor at the top of the terminal, 
+                            // so try to scroll (if possible)
                             if cursor.row == 0 {
                                 if *scroll_y > 0 {
                                     *scroll_y -= 1;
                                 }
+                            // Normal up
                             } else {
                                 cursor.row -= 1;
                             }
+                        }
 
-                            if let Some(doc) = doc {
-                                // Get a reference to the line the cursor is at
-                                // on the document
-                                let curr_line = 
-                                    &doc.inner_lines[*scroll_y + cursor.row];
-
-                                // Update the cursor position knowning that,
-                                // also handling the case that the last 
-                                // movement was on last line, so this will also
-                                // be on the last line
-                                let max_col = curr_line.len()
-                                    .checked_sub(1).unwrap_or(0);
-                                if *last_column {
-                                    cursor.column = max_col;
-                                } else {
-                                    cursor.column = 
-                                        usize::min(max_col, cursor.column);
-                                }
-                            }
+                        // Adjust the move up on the file to the proper column
+                        if let Some(doc) = doc {
+                            cursor.adjust_column_vertical(
+                                &doc,
+                                *modifiers,
+                                scroll_y,
+                                last_column,
+                                last_padding);
+                        } else {
+                            cursor.row = 0;
                         }
                     }
                     Event::Key(KeyEvent {
@@ -279,37 +362,33 @@ fn process_keypress(
                         // Normal Down: go to next line, to the same column or
                         // closest to end of line
                         } else {
+                            // Special case the cursor is at the bottom of the
+                            // terminal, scroll if possible
                             if cursor.row == rows {
                                 if *scroll_y < doc_lines - rows {
                                     *scroll_y += 1;
                                 }
                             } else {
-                                if cursor.row < doc_lines - *scroll_y - 1 {
-                                    cursor.row += 1;
+                                // Special case of empty file
+                                if *scroll_y != 0 || doc_lines != 0 {
+                                    // Normal move down
+                                    if cursor.row < doc_lines - *scroll_y - 1 {
+                                        cursor.row += 1;
+                                    }
                                 }
                             }
+                        }
 
-                            if let Some(doc) = doc {
-                                // Get a reference to the line the cursor is at 
-                                // on the document
-                                let curr_line = 
-                                    &doc.inner_lines[*scroll_y + cursor.row];
-
-                                // Update the cursor position knowning that,
-                                // also handling the case that the last 
-                                // movement was on last line, so this will also
-                                // be on the last line
-                                let max_col = curr_line.len()
-                                    .checked_sub(1).unwrap_or(0);
-                                if *last_column {
-                                    cursor.column = max_col;
-                                } else {
-                                    cursor.column = 
-                                        usize::min(max_col, cursor.column);
-                                }
-                            } else {
-                                cursor.row = 0;
-                            }
+                        // Adjust the move down on the file to the proper column
+                        if let Some(doc) = doc {
+                            cursor.adjust_column_vertical(
+                                &doc,
+                                *modifiers,
+                                scroll_y,
+                                last_column,
+                                last_padding);
+                        } else {
+                            cursor.row = 0;
                         }
                     }
                     Event::Key(KeyEvent {
@@ -354,7 +433,132 @@ fn process_keypress(
                             cursor.column = 
                                 usize::max(0, cursor.column
                                                 .checked_sub(1).unwrap_or(0));
+                        }
+                    }
 
+                    // Handle scroll up/down
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::ScrollUp,
+                        modifiers,
+                        ..
+                    }) => {
+                        // Shift + Up: Go up by an entire page
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            // Normal page up
+                            if scroll_y.checked_sub(rows).is_some() {
+                                *scroll_y -= rows;
+                            // Special case you only can get to the top of 
+                            // the terminal
+                            } else {
+                                *scroll_y = 0;
+                                cursor.row = 0;
+                            }
+                        // Normal Up: go to previous line, to the same column 
+                        // or closest to end of line
+                        } else {
+                            // Special case cursor at the top of the terminal, 
+                            // so try to scroll (if possible)
+                            if cursor.row == 0 {
+                                if *scroll_y > 0 {
+                                    *scroll_y -= 1;
+                                    cursor.row += 1;
+                                }
+                            // Normal up
+                            } else if *scroll_y > 0 {
+                               *scroll_y -= 1;
+                               if cursor.row != rows {
+                                   cursor.row += 1;
+                               }
+                            }
+                        }
+
+                        // Adjust the move up on the file to the proper column
+                        if let Some(doc) = doc {
+                            cursor.adjust_column_vertical(
+                                &doc,
+                                *modifiers,
+                                scroll_y,
+                                last_column,
+                                last_padding);
+                        } else {
+                            cursor.row = 0;
+                        }
+                    }
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        modifiers,
+                        ..
+                    }) => {
+                        // Shift + Down: Go down by an entire page
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            if *scroll_y + rows <= doc_lines {
+                                *scroll_y += rows;
+                            } else {
+                                cursor.row = doc_lines % rows - 1;
+                            }
+                        // Normal Down: incrase the `scroll_y` and maintains
+                        // the cursor on the same position relative to the 
+                        // document
+                        } else {
+                            // Special case the cursor is at the bottom of the
+                            // terminal, scroll if possible
+                            if cursor.row == rows {
+                                if *scroll_y < doc_lines - rows {
+                                    *scroll_y += 1;
+                                    cursor.row -= 1;
+                                }
+                            } else {
+                                // Special case of empty file
+                                if *scroll_y != 0 || doc_lines != 0 {
+                                    // Normal move down
+                                    if cursor.row < doc_lines - *scroll_y - 1 {
+                                        *scroll_y += 1;
+                                        if cursor.row != 0 {
+                                            cursor.row -= 1;
+                                        }
+                                    }
+
+                                }
+                            }
+                        }
+
+                        // Adjust the move down on the file to the proper 
+                        // column
+                        if let Some(doc) = doc {
+                            cursor.adjust_column_vertical(
+                                &doc,
+                                *modifiers,
+                                scroll_y,
+                                last_column,
+                                last_padding);
+                        } else {
+                            cursor.row = 0;
+                        }
+
+                    }
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Up(_),
+                        row,
+                        column,
+                        ..
+                    }) => {
+                        // Translate the terminal coords to buffer coords
+                        let row = usize::min(*row as usize, 
+                                             doc_lines % rows - 1);
+                        let column = usize::min(*column as usize - 4, columns);
+
+                        cursor.row = row;
+                        cursor.column = column;
+
+                        if let Some(doc) = doc {
+                            cursor.adjust_column_random(
+                                &doc,
+                                scroll_y,
+                                last_column,
+                                last_padding);
+                        } else {
+                            cursor.row = 0;
+                            cursor.column = 4;
                         }
                     }
                     _ => {}
@@ -381,7 +585,7 @@ fn main() -> Result<()> {
     };
 
     // Initial position of the cursor
-    let mut cursor = Position {
+    let mut cursor = Cursor {
         column: 0,
         row: 0
     };
@@ -400,8 +604,9 @@ fn main() -> Result<()> {
         EnableMouseCapture)?;
 
 
-    let mut scroll_y = 0;
     let mut last_column = false;
+    let mut last_padding = 0;
+    let mut scroll_y = 0;
     let mut running = true;
     loop {
         // Repaint on the screen what needs to be repainted
@@ -418,6 +623,7 @@ fn main() -> Result<()> {
             &mut running, 
             &mut cursor,
             &mut last_column,
+            &mut last_padding,
             &mut scroll_y,
             &mut curr_doc)?;
     }
