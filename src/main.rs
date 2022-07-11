@@ -47,7 +47,7 @@ impl Document {
         while i < bytes.len() {
             if bytes[i] == b'\r' {
                 if i < bytes.len() - 1 {
-                    if bytes[i] == b'\n' {
+                    if bytes[i + 1] == b'\n' {
                         lines.push(Line {
                             start,
                             len
@@ -109,7 +109,7 @@ fn refresh_screen(
 
     // Re-draw all the rows
     let (columns, rows) = terminal::size()?;
-    for row in 0..rows {
+    for row in 0..rows - 1 {
         // Clear this line
         execute!(stdout, 
             crossterm::cursor::MoveTo(0, row),
@@ -127,7 +127,7 @@ fn refresh_screen(
                     crossterm::cursor::MoveTo(0, row),
                     PrintStyledContent(format!("{:3} ", row as usize + scroll_y)
                         .with(Color::Yellow)),
-                    Print(line));
+                    Print(line))?;
             }
         } else {
             // Print the intro (no document opened)
@@ -144,11 +144,54 @@ fn refresh_screen(
         }
     }
 
+    // Print the status bar
+    //
+    // TODO: Modifications in-place of the `status_msgp` might improve perf
+    let mut status_msg = String::with_capacity(columns as usize);
+    if let Some(doc) = document {
+        // Insert the path and a couple whitespaces, not sure if the conversion
+        // from path -> str can really fail
+        status_msg.push_str(doc.path.to_str().unwrap());
+        for _ in 0..4*columns/6 {
+            status_msg.push(' ');
+        }
+
+        // Create the sub-string with the cursor location + percentage of file
+        // explored
+        let percentage = 
+            (scroll_y + cursor.row) as f32 / doc.inner_lines.len() as f32;
+
+        // It must have a whitespace inside always, so look for it and insert
+        // more whitespaces until `doc_status` can fill all the remaining 
+        // status bar characters
+        let mut doc_status = format!("{},{}{:4}%", 
+                cursor.column, cursor.row, (percentage * 100.0) as u32);
+        let mut i = 0;
+        while !doc_status.as_bytes()[i].is_ascii_whitespace() {
+            i+= 1;
+        }
+        while status_msg.len() + doc_status.len() < columns as usize {
+            doc_status.insert(i, ' ');
+        }
+        status_msg.push_str(&doc_status);
+    } else {
+        // On case no document loaded the status bar is this simple
+        status_msg.push_str("[blank]");
+        for _ in 0..columns - 7 {
+            status_msg.push(' ');
+        }
+    }
+    execute!(stdout,
+        crossterm::cursor::MoveToNextLine(1),
+        PrintStyledContent(status_msg
+            .with(Color::Black)
+            .on(Color::White)));
+
     // Show again the cursor
     execute!(stdout, 
-        crossterm::cursor::MoveTo(cursor.column as u16, cursor.row as u16),
+        crossterm::cursor::MoveTo(cursor.column as u16 + 4, cursor.row as u16),
         crossterm::cursor::Show)?;
-    
+
     Ok(())
 }
 
@@ -156,9 +199,20 @@ fn refresh_screen(
 fn process_keypress(
     running: &mut bool, 
     cursor: &mut Position,
+    last_column: &mut bool,
     scroll_y: &mut usize,
-    doc_lines: usize,
+    doc: &mut Option<Document>,
 ) -> Result<()> {
+    let mut doc_lines = match doc {
+        Some(ref doc) => doc.inner_lines.len(),
+        None => 0,
+    };
+
+    // Extract the size of the working buffer
+    let (columns, rows) = terminal::size()?;
+    let rows = (rows - 2) as usize;
+    let columns = (columns - 4) as usize;
+
     match poll(Duration::from_millis(50)) {
         Ok(true) => {
             if let Ok(ref event) = read() {
@@ -169,29 +223,138 @@ fn process_keypress(
                     }) => *running = false,
                     Event::Key(KeyEvent {
                         code: KeyCode::Up,
-                        ..
+                        modifiers
                     }) => {
-                        if cursor.row == 0 {
-                            if *scroll_y > 0 {
-                                *scroll_y -= 1;
+                        // Shift + Up: Go up by an entire page
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            if scroll_y.checked_sub(rows).is_some() {
+                                *scroll_y -= rows;
+                            } else {
+                                *scroll_y = 0;
+                                cursor.row = 0;
                             }
+                        // Normal Up: go to previous line, to the same column 
+                        // or closest to end of line
                         } else {
-                            cursor.row -= 1;
+                            if cursor.row == 0 {
+                                if *scroll_y > 0 {
+                                    *scroll_y -= 1;
+                                }
+                            } else {
+                                cursor.row -= 1;
+                            }
+
+                            if let Some(doc) = doc {
+                                // Get a reference to the line the cursor is at
+                                // on the document
+                                let curr_line = 
+                                    &doc.inner_lines[*scroll_y + cursor.row];
+
+                                // Update the cursor position knowning that,
+                                // also handling the case that the last 
+                                // movement was on last line, so this will also
+                                // be on the last line
+                                let max_col = curr_line.len()
+                                    .checked_sub(1).unwrap_or(0);
+                                if *last_column {
+                                    cursor.column = max_col;
+                                } else {
+                                    cursor.column = 
+                                        usize::min(max_col, cursor.column);
+                                }
+                            }
                         }
                     }
                     Event::Key(KeyEvent {
                         code: KeyCode::Down,
-                        ..
+                        modifiers
                     }) => {
-                        let (columns, rows) = terminal::size()?;
-                        if cursor.row == rows as usize {
-                            if *scroll_y < doc_lines - rows as usize {
-                                *scroll_y += 1;
+                        // Shift + Down: Go down by an entire page
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            if *scroll_y + rows <= doc_lines {
+                                *scroll_y += rows;
+                            } else {
+                                cursor.row = doc_lines % rows - 1;
                             }
+                        // Normal Down: go to next line, to the same column or
+                        // closest to end of line
                         } else {
-                            if cursor.row < doc_lines - *scroll_y - 1 {
-                                cursor.row += 1;
+                            if cursor.row == rows {
+                                if *scroll_y < doc_lines - rows {
+                                    *scroll_y += 1;
+                                }
+                            } else {
+                                if cursor.row < doc_lines - *scroll_y - 1 {
+                                    cursor.row += 1;
+                                }
                             }
+
+                            if let Some(doc) = doc {
+                                // Get a reference to the line the cursor is at 
+                                // on the document
+                                let curr_line = 
+                                    &doc.inner_lines[*scroll_y + cursor.row];
+
+                                // Update the cursor position knowning that,
+                                // also handling the case that the last 
+                                // movement was on last line, so this will also
+                                // be on the last line
+                                let max_col = curr_line.len()
+                                    .checked_sub(1).unwrap_or(0);
+                                if *last_column {
+                                    cursor.column = max_col;
+                                } else {
+                                    cursor.column = 
+                                        usize::min(max_col, cursor.column);
+                                }
+                            } else {
+                                cursor.row = 0;
+                            }
+                        }
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Right,
+                        modifiers
+                    }) => {
+                        if let Some(doc) = doc {
+                            // Get a reference to the line the cursor is at on
+                            // the document
+                            let curr_line = 
+                                &doc.inner_lines[*scroll_y + cursor.row];
+
+                            // Update the cursor position knowning that
+                            let max_col = curr_line.len()
+                                                .checked_sub(1).unwrap_or(0);
+                            cursor.column = 
+                                usize::min(max_col, cursor.column + 1);
+
+                            // Needed to handle the case last movement was at
+                            // end of line and you go up/down and need to still
+                            // be at the end of line
+                            if cursor.column == max_col {
+                                *last_column = true;
+                            }
+                        }
+                    } 
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Left,
+                        modifiers
+                    }) => {
+                        // Every movement to the left means no more end
+                        // of line
+                        *last_column = false;
+
+                        if let Some(doc) = doc {
+                            // Get a reference to the line the cursor is at on
+                            // the document
+                            let curr_line = 
+                                &doc.inner_lines[*scroll_y + cursor.row];
+
+                            // Update the cursor position knowning that
+                            cursor.column = 
+                                usize::max(0, cursor.column
+                                                .checked_sub(1).unwrap_or(0));
+
                         }
                     }
                     _ => {}
@@ -232,13 +395,13 @@ fn main() -> Result<()> {
 
     // Enable mouse support
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnableMouseCapture)?;
+    execute!(stdout, 
+        terminal::EnterAlternateScreen,
+        EnableMouseCapture)?;
 
-    let mut doc_lines = match curr_doc {
-        Some(ref doc) => doc.inner_lines.len(),
-        None => 0,
-    };
+
     let mut scroll_y = 0;
+    let mut last_column = false;
     let mut running = true;
     loop {
         // Repaint on the screen what needs to be repainted
@@ -247,13 +410,23 @@ fn main() -> Result<()> {
         // Check if the editor should keep running, if it should close it will
         // clear all it drawed
         if !running {
-            execute!(stdout, terminal::Clear(terminal::ClearType::Purge))?;
             break;
         }
 
         // Process events
-        process_keypress(&mut running, &mut cursor, &mut scroll_y, doc_lines)?;
+        process_keypress(
+            &mut running, 
+            &mut cursor,
+            &mut last_column,
+            &mut scroll_y,
+            &mut curr_doc)?;
     }
+
+    // Disable mouse support and because we entered an alternative screen, when
+    // we leave we resume all the output that was before the editor execution
+    execute!(stdout,
+        terminal::LeaveAlternateScreen,
+        DisableMouseCapture)?;
 
     // Back to normal terminal after closing
     terminal::disable_raw_mode()?;
