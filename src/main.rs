@@ -69,6 +69,10 @@ impl Cursor {
             self.column = usize::min(max_col, new_column);
         }
     }
+
+    /// Adjust the column when a random movement occurs, mouse for example, it
+    /// ensures that the column doesn't exceeds the line width and updates some
+    /// metadata needed for the next event loop iteration
     fn adjust_column_random(
         &mut self,
         doc: &Document,
@@ -357,7 +361,9 @@ fn process_keypress(
                             if *scroll_y + rows <= doc_lines {
                                 *scroll_y += rows;
                             } else {
-                                cursor.row = doc_lines % rows - 1;
+                                cursor.row = (doc_lines % rows)
+                                                .checked_sub(1)
+                                                .unwrap_or(0);
                             }
                         // Normal Down: go to next line, to the same column or
                         // closest to end of line
@@ -494,7 +500,9 @@ fn process_keypress(
                             if *scroll_y + rows <= doc_lines {
                                 *scroll_y += rows;
                             } else {
-                                cursor.row = doc_lines % rows - 1;
+                                cursor.row = (doc_lines % rows)
+                                                .checked_sub(1)
+                                                .unwrap_or(0);
                             }
                         // Normal Down: incrase the `scroll_y` and maintains
                         // the cursor on the same position relative to the 
@@ -544,7 +552,8 @@ fn process_keypress(
                     }) => {
                         // Translate the terminal coords to buffer coords
                         let row = usize::min(*row as usize, 
-                                             doc_lines % rows - 1);
+                                             (doc_lines % rows)
+                                                .checked_sub(1).unwrap_or(0));
                         let column = usize::min(*column as usize - 4, columns);
 
                         cursor.row = row;
@@ -558,7 +567,7 @@ fn process_keypress(
                                 last_padding);
                         } else {
                             cursor.row = 0;
-                            cursor.column = 4;
+                            cursor.column = 0;
                         }
                     }
                     _ => {}
