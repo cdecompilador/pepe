@@ -1,8 +1,8 @@
-use std::io::Stdout;
+use std::io::{Write, Stdout};
 use std::time::Duration;
 use std::path::{Path, PathBuf};
 
-use crossterm::{QueueableCommand, execute, terminal};
+use crossterm::{QueueableCommand, queue, execute, terminal};
 use crossterm::style::{Print, PrintStyledContent, Color, Stylize, Attribute};
 use crossterm::event::*;
 
@@ -99,6 +99,106 @@ impl Cursor {
         if max_col <= self.column {
             *last_column = true;
             self.column = max_col;
+        }
+    }
+
+    /// Move down by a single unit if possible on the file, alse update the
+    /// state for the refresh
+    fn move_up(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        doc_line: usize,
+        scroll_y: &mut usize,
+        last_cursor: &mut Option<Cursor>,
+        modif_all: &mut bool
+    ) {
+        // Special case cursor at the top of the terminal, 
+        // so try to scroll (if possible)
+        if self.row == 0 {
+            if *scroll_y > 0 {
+                *modif_all = true;
+                *scroll_y -= 1;
+            }
+
+        // Normal up
+        } else {
+            *last_cursor = Some(*self);
+            self.row -= 1;
+        }
+    }
+
+    /// Move up by a single unit if possible on the file, alse update the state
+    /// for the refresh
+    fn move_down(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        doc_lines: usize,
+        scroll_y: &mut usize,
+        last_cursor: &mut Option<Cursor>,
+        modif_all: &mut bool
+    ) {
+        // Special case the cursor is at the bottom of the
+        // terminal, scroll if possible
+        if self.row == rows {
+            if *scroll_y < doc_lines - rows {
+                *modif_all = true;
+                *scroll_y += 1;
+            }
+        } else {
+            // Special case of empty file
+            if *scroll_y != 0 || doc_lines != 0 {
+                // Normal move down
+                if self.row < doc_lines - *scroll_y - 1 {
+                    *last_cursor = Some(*self);
+                    self.row += 1;
+                }
+            }
+        }
+    }
+
+    fn page_up(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        doc_lines: usize,
+        scroll_y: &mut usize,
+        last_cursor: &mut Option<Cursor>,
+        modif_all: &mut bool
+    ) {
+        // Normal page up
+        if scroll_y.checked_sub(rows).is_some() {
+            *modif_all = true;
+            *scroll_y -= rows;
+
+        // Special case you only can get to the top of 
+        // the terminal
+        } else {
+            *last_cursor = Some(*self);            
+
+            *scroll_y = 0;
+            self.row = 0;
+        }
+    }
+
+    fn page_down(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        doc_lines: usize,
+        scroll_y: &mut usize,
+        last_cursor: &mut Option<Cursor>,
+        modif_all: &mut bool
+    ) {
+        if *scroll_y + rows <= doc_lines {
+            *modif_all = true;
+            *scroll_y += rows;
+        } else {
+            *last_cursor = Some(*self);
+            self.row = (doc_lines % rows)
+                .checked_sub(1)
+                .unwrap_or(0);
         }
     }
 }
@@ -199,11 +299,11 @@ fn refresh_screen(
     let (columns, rows) = terminal::size()?;
     for row in 0..rows - 1 {
         // Clear this line
-        execute!(stdout, 
+        queue!(stdout, 
             crossterm::cursor::MoveTo(0, row),
             terminal::Clear(terminal::ClearType::CurrentLine))?;
 
-        execute!(stdout,
+        queue!(stdout,
             crossterm::cursor::MoveTo(0, row),
             Print("~ "
                 .with(Color::Yellow)))?;
@@ -211,7 +311,7 @@ fn refresh_screen(
         // Print the document
         if let Some(doc) = document {
             if let Some(line) = &doc.inner_lines.get(row as usize + scroll_y) {
-                execute!(stdout,
+                queue!(stdout,
                     crossterm::cursor::MoveTo(0, row),
                     PrintStyledContent(format!("{:3} ", row as usize + scroll_y)
                         .with(Color::Yellow)),
@@ -225,7 +325,7 @@ fn refresh_screen(
                 assert!(columns / 2 >= msg.content().len() as u16 / 2);
                 let msg_start = columns / 2 - msg.content().len() as u16 / 2;
 
-                execute!(stdout,
+                queue!(stdout,
                     crossterm::cursor::MoveTo(msg_start, row),
                     PrintStyledContent(msg))?;
             }
@@ -240,9 +340,6 @@ fn refresh_screen(
         // Insert the path and a couple whitespaces, not sure if the conversion
         // from path -> str can really fail
         status_msg.push_str(doc.path.to_str().unwrap());
-        for _ in 0..4*columns/6 {
-            status_msg.push(' ');
-        }
 
         // Create the sub-string with the cursor location + percentage of file
         // explored
@@ -252,16 +349,20 @@ fn refresh_screen(
         // It must have a whitespace inside always, so look for it and insert
         // more whitespaces until `doc_status` can fill all the remaining 
         // status bar characters
-        let mut doc_status = format!("{},{}{:4}%", 
+        let doc_status = format!("{},{}{:8}%", 
                 cursor.column, cursor.row, (percentage * 100.0) as u32);
-        let mut i = 0;
-        while !doc_status.as_bytes()[i].is_ascii_whitespace() {
-            i+= 1;
+        let mut ws_between = (columns as usize).checked_sub(
+                                    status_msg.len())
+                                        .and_then(|x| 
+                                            x.checked_sub(doc_status.len()))
+                                    .unwrap_or(0);
+        if ws_between != 0 {
+            while ws_between != 0 {
+                status_msg.push(' ');
+                ws_between -= 1;
+            }
+            status_msg.push_str(&doc_status);
         }
-        while status_msg.len() + doc_status.len() < columns as usize {
-            doc_status.insert(i, ' ');
-        }
-        status_msg.push_str(&doc_status);
     } else {
         // On case no document loaded the status bar is this simple
         status_msg.push_str("[blank]");
@@ -269,16 +370,19 @@ fn refresh_screen(
             status_msg.push(' ');
         }
     }
-    execute!(stdout,
+    queue!(stdout,
         crossterm::cursor::MoveToNextLine(1),
         PrintStyledContent(status_msg
             .with(Color::Black)
             .on(Color::White)))?;
 
     // Show again the cursor
-    execute!(stdout, 
+    queue!(stdout, 
         crossterm::cursor::MoveTo(cursor.column as u16 + 4, cursor.row as u16),
         crossterm::cursor::Show)?;
+
+    // Send all the draw commands at once
+    stdout.flush()?;
 
     Ok(())
 }
@@ -291,6 +395,9 @@ fn process_keypress(
     last_padding: &mut usize,
     scroll_y: &mut usize,
     doc: &mut Option<Document>,
+    last_cursor: &mut Option<Cursor>,
+    modif_row: &mut Option<usize>,
+    modif_all: &mut bool,
 ) -> Result<()> {
     let mut doc_lines = match doc {
         Some(ref doc) => doc.inner_lines.len(),
@@ -313,32 +420,26 @@ fn process_keypress(
                     code: KeyCode::Up,
                     modifiers
                 }) => {
-                    // Shift + Up: Go up by an entire page
+                    // Page up
                     if modifiers.contains(KeyModifiers::SHIFT) {
-                        // Normal page up
-                        if scroll_y.checked_sub(rows).is_some() {
-                            *scroll_y -= rows;
-                            // Special case you only can get to the top of 
-                            // the terminal
-                        } else {
-                            *scroll_y = 0;
-                            cursor.row = 0;
-                        }
+                        cursor.page_up(
+                            rows,
+                            columns,
+                            doc_lines,
+                            scroll_y,
+                            last_cursor,
+                            modif_all);
 
                     // Normal Up: go to previous line, to the same column 
                     // or closest to end of line
                     } else {
-                        // Special case cursor at the top of the terminal, 
-                        // so try to scroll (if possible)
-                        if cursor.row == 0 {
-                            if *scroll_y > 0 {
-                                *scroll_y -= 1;
-                            }
-
-                        // Normal up
-                        } else {
-                            cursor.row -= 1;
-                        }
+                        cursor.move_up(
+                            rows,
+                            columns,
+                            doc_lines,
+                            scroll_y,
+                            last_cursor,
+                            modif_all);
                     }
 
                     // Adjust the move up on the file to the proper column
@@ -357,34 +458,26 @@ fn process_keypress(
                     code: KeyCode::Down,
                     modifiers
                 }) => {
-                    // Shift + Down: Go down by an entire page
+                    // Page down
                     if modifiers.contains(KeyModifiers::SHIFT) {
-                        if *scroll_y + rows <= doc_lines {
-                            *scroll_y += rows;
-                        } else {
-                            cursor.row = (doc_lines % rows)
-                                .checked_sub(1)
-                                .unwrap_or(0);
-                        }
+                        cursor.page_down(
+                            rows,
+                            columns,
+                            doc_lines,
+                            scroll_y,
+                            last_cursor,
+                            modif_all);
 
                     // Normal Down: go to next line, to the same column or
                     // closest to end of line
                     } else {
-                        // Special case the cursor is at the bottom of the
-                        // terminal, scroll if possible
-                        if cursor.row == rows {
-                            if *scroll_y < doc_lines - rows {
-                                *scroll_y += 1;
-                            }
-                        } else {
-                            // Special case of empty file
-                            if *scroll_y != 0 || doc_lines != 0 {
-                                // Normal move down
-                                if cursor.row < doc_lines - *scroll_y - 1 {
-                                    cursor.row += 1;
-                                }
-                            }
-                        }
+                        cursor.move_down(
+                            rows as usize,
+                            columns as usize,
+                            doc_lines,
+                            scroll_y,
+                            last_cursor,
+                            modif_all);
                     }
 
                     // Adjust the move down on the file to the proper column
@@ -418,14 +511,33 @@ fn process_keypress(
                         }
 
                         // This applies to all word movements, if at the end of
-                        // line just try going to the next
+                        // line do a Normal down
                         if cursor.column == max_col {
-                            cursor.row += 1;
-                            cursor.column = 0;
+                            *last_cursor = Some(*cursor);
+
+                            // Normal move down
+                            cursor.move_down(
+                                rows as usize,
+                                columns as usize,
+                                doc_lines,
+                                scroll_y,
+                                last_cursor,
+                                modif_all);
+
+
+                            // Adjust the move down on the file to the proper
+                            // column
+                            cursor.adjust_column_vertical(
+                                &doc,
+                                *modifiers,
+                                scroll_y,
+                                last_column,
+                                last_padding);
 
                             return Ok(());
                         }
 
+                        *last_cursor = Some(*cursor);
                         // Simple word movement (until next whitespace)
                         if modifiers.contains(KeyModifiers::CONTROL) {
                             match curr_line.as_bytes()[cursor.column] {
@@ -467,7 +579,6 @@ fn process_keypress(
                                 usize::min(max_col, cursor.column + 1);
                         }
 
-
                         // Needed to handle the case last movement was at end
                         // of line and you go up/down and need to still be at
                         // the end of line
@@ -486,13 +597,24 @@ fn process_keypress(
                     if let Some(doc) = doc {
                         // This applies to all word movements, if at the end of
                         // line just try going to the next
-                        if cursor.column == 0 && cursor.row > 0 {
-                            cursor.row -= 1;
+                        if cursor.column == 0 && cursor.row >= 0 {
+                            // Normal move up
+                            cursor.move_up(
+                                rows,
+                                columns,
+                                doc_lines,
+                                scroll_y,
+                                last_cursor,
+                                modif_all);
 
-                            let new_max_col = 
-                                doc.inner_lines[*scroll_y + cursor.row].len();
-                            cursor.column = new_max_col
-                                .checked_sub(1).unwrap_or(0);
+                            // Adjust the move down on the file to the proper
+                            // column
+                            cursor.adjust_column_vertical(
+                                &doc,
+                                *modifiers,
+                                scroll_y,
+                                last_column,
+                                last_padding);
 
                             return Ok(());
                         }
@@ -501,6 +623,11 @@ fn process_keypress(
                         // document
                         let curr_line = 
                             &doc.inner_lines[*scroll_y + cursor.row];
+
+                        // Bounds check
+                        if cursor.row == doc_lines - *scroll_y - 1 {
+                            return Ok(());
+                        }
 
                         // Simple word movement (until next whitespace)
                         if modifiers.contains(KeyModifiers::CONTROL) {
@@ -549,17 +676,15 @@ fn process_keypress(
                     modifiers,
                     ..
                 }) => {
-                    // Shift + Up: Go up by an entire page
+                    // Page up
                     if modifiers.contains(KeyModifiers::SHIFT) {
-                        // Normal page up
-                        if scroll_y.checked_sub(rows).is_some() {
-                            *scroll_y -= rows;
-                            // Special case you only can get to the top of the
-                            // terminal
-                        } else {
-                            *scroll_y = 0;
-                            cursor.row = 0;
-                        }
+                        cursor.page_up(
+                            rows,
+                            columns,
+                            doc_lines,
+                            scroll_y,
+                            last_cursor,
+                            modif_all);
 
                     // Normal Up: go to previous line, to the same column or
                     // closest to end of line
@@ -598,22 +723,24 @@ fn process_keypress(
                     modifiers,
                     ..
                 }) => {
-                    // Shift + Down: Go down by an entire page
+                    // Page down
                     if modifiers.contains(KeyModifiers::SHIFT) {
-                        if *scroll_y + rows <= doc_lines {
-                            *scroll_y += rows;
-                        } else {
-                            cursor.row = (doc_lines % rows)
-                                .checked_sub(1)
-                                .unwrap_or(0);
-                        }
-                    // Normal Down: incrase the `scroll_y` and maintains the
+                        cursor.page_down(
+                            rows,
+                            columns,
+                            doc_lines,
+                            scroll_y,
+                            last_cursor,
+                            modif_all);
+
+                    // Scroll Down: incrase the `scroll_y` and maintains the
                     // cursor on the same position relative to the document
                     } else {
                         // Special case the cursor is at the bottom of the
                         // terminal, scroll if possible
                         if cursor.row == rows {
                             if *scroll_y < doc_lines - rows {
+                                *modif_all = true;
                                 *scroll_y += 1;
                                 cursor.row -= 1;
                             }
@@ -644,7 +771,6 @@ fn process_keypress(
                     } else {
                         cursor.row = 0;
                     }
-
                 }
                 Event::Mouse(MouseEvent {
                     kind: MouseEventKind::Up(_),
@@ -652,11 +778,15 @@ fn process_keypress(
                     column,
                     ..
                 }) => {
+                    *last_cursor = Some(*cursor);
+
                     // Translate the terminal coords to buffer coords
                     let row = usize::min(*row as usize, 
                         (doc_lines % rows)
                         .checked_sub(1).unwrap_or(0));
-                    let column = usize::min(*column as usize - 4, columns);
+                    let column = usize::min(
+                                    column.checked_sub(4).unwrap_or(0) as usize,
+                                    columns);
 
                     cursor.row = row;
                     cursor.column = column;
@@ -710,16 +840,27 @@ fn main() -> Result<()> {
     let mut stdout = std::io::stdout();
     execute!(stdout, 
         terminal::EnterAlternateScreen,
+        terminal::EnableLineWrap,
+        crossterm::cursor::DisableBlinking,
         EnableMouseCapture)?;
 
 
+    // Variables to update the screen efficiently
+    let mut modif_column = None;
+    let mut modif_all = false;
+    let mut last_cursor = None;
+
+    // Editor state needed for movement
     let mut last_column = false;
     let mut last_padding = 0;
     let mut scroll_y = 0;
+
     let mut running = true;
     loop {
         // Repaint on the screen what needs to be repainted
         refresh_screen(&mut stdout, &curr_doc, &cursor, scroll_y)?;
+
+        last_cursor = None;
 
         // Check if the editor should keep running, if it should close it will
         // clear all it drawed
@@ -734,7 +875,13 @@ fn main() -> Result<()> {
             &mut last_column,
             &mut last_padding,
             &mut scroll_y,
-            &mut curr_doc)?;
+            &mut curr_doc,
+            &mut last_cursor,
+            &mut modif_column,
+            &mut modif_all)?;
+
+        modif_column = None;
+        modif_all = false;
     }
 
     // Disable mouse support and because we entered an alternative screen, when
