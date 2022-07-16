@@ -234,7 +234,7 @@ fn refresh_screen(
 
     // Print the status bar
     //
-    // TODO: Modifications in-place of the `status_msg` might improve perf
+    // TODO: Modifications in-place of the `status_msgp` might improve perf
     let mut status_msg = String::with_capacity(columns as usize);
     if let Some(doc) = document {
         // Insert the path and a couple whitespaces, not sure if the conversion
@@ -412,59 +412,35 @@ fn process_keypress(
                         let max_col = curr_line.len()
                                 .checked_sub(1).unwrap_or(0);
 
-                        // Bounds check
-                        if cursor.row == doc_lines - *scroll_y - 1 {
-                            return Ok(());
-                        }
-
-                        // This applies to all word movements, if at the end of
-                        // line just try going to the next
-                        if cursor.column == max_col {
-                            cursor.row += 1;
-                            cursor.column = 0;
-
-                            return Ok(());
-                        }
-
                         // Simple word movement (until next whitespace)
                         if modifiers.contains(KeyModifiers::CONTROL) {
                             match curr_line.as_bytes()[cursor.column] {
-                                b' ' => {
-                                    let mut new_col = cursor.column;
-                                    while new_col <= max_col && 
-                                          curr_line
-                                              .as_bytes()[new_col] 
-                                                    == b' ' {
-                                        new_col += 1;
+                                b' ' => loop {
+                                    while curr_line.as_bytes()[cursor.column] 
+                                            == b' ' {
+                                        cursor.column += 1;
                                     }
-
-                                    cursor.column = 
-                                        usize::min(max_col, new_col);
+                                    cursor.column =
+                                        usize::min(max_col, cursor.column + 1);
+                                    // dbg!(cursor.column);
+                                    // panic!();
                                 },
-                                _ => {
-                                    let mut new_col = cursor.column;
-                                    while new_col < max_col &&
-                                          curr_line
-                                              .as_bytes()[new_col]
-                                                    != b' ' {
-                                        new_col += 1;
+                                _ => loop {
+                                    while curr_line.as_bytes()[cursor.column] 
+                                            != b' ' {
+                                        cursor.column += 1;
+                                        dbg!(cursor.column);
                                     }
-                                    while new_col < max_col &&
-                                          curr_line
-                                              .as_bytes()[new_col]
-                                                    == b' ' {
-                                        new_col += 1;
-                                    }
-
-                                    cursor.column = 
-                                        usize::min(max_col, new_col);
+                                    cursor.column =
+                                        usize::min(max_col, cursor.column + 1);
+                                    dbg!(cursor.column)
                                 }
                             }
 
-                        // Normal cursor movement 
+                        // Normal cursor update
                         } else {
                             cursor.column = 
-                                usize::min(max_col, cursor.column + 1);
+                                    usize::min(max_col, cursor.column + 1);
                         }
 
 
@@ -484,62 +460,14 @@ fn process_keypress(
                     *last_column = false;
 
                     if let Some(doc) = doc {
-                        // This applies to all word movements, if at the end of
-                        // line just try going to the next
-                        if cursor.column == 0 && cursor.row > 0 {
-                            cursor.row -= 1;
-
-                            let new_max_col = 
-                                doc.inner_lines[*scroll_y + cursor.row].len();
-                            cursor.column = new_max_col
-                                .checked_sub(1).unwrap_or(0);
-
-                            return Ok(());
-                        }
-
                         // Get a reference to the line the cursor is at on the
                         // document
                         let curr_line = 
                             &doc.inner_lines[*scroll_y + cursor.row];
 
-                        // Simple word movement (until next whitespace)
-                        if modifiers.contains(KeyModifiers::CONTROL) {
-                            match curr_line.as_bytes()[cursor.column] {
-                                b' ' => {
-                                    let mut new_col = cursor.column;
-                                    while new_col != 0 && 
-                                          curr_line
-                                              .as_bytes()[new_col] 
-                                                    == b' ' {
-                                        new_col -= 1;
-                                    }
-
-                                    cursor.column = new_col;
-                                },
-                                _ => {
-                                    let mut new_col = cursor.column;
-                                    while new_col != 0 &&
-                                          curr_line
-                                              .as_bytes()[new_col]
-                                                    != b' ' {
-                                        new_col -= 1;
-                                    }
-                                    while new_col != 0 && 
-                                          curr_line
-                                              .as_bytes()[new_col] 
-                                                    == b' ' {
-                                        new_col -= 1;
-                                    }
-
-                                    cursor.column = new_col;
-                                }
-                            }
-
-                        // Normal cursor movement
-                        } else {
-                            cursor.column = usize::max(0, cursor.column
-                                .checked_sub(1).unwrap_or(0));
-                        }
+                        // Update the cursor position knowning that
+                        cursor.column = usize::max(0, cursor.column
+                                            .checked_sub(1).unwrap_or(0));
                     }
                 }
 
