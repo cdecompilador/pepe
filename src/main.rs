@@ -429,7 +429,7 @@ fn refresh_screen(
     for row in 0..(*rows - 1) as u16 {
         // Clear this line
         queue!(stdout, 
-            crossterm::cursor::MoveToRow(0),
+            crossterm::cursor::MoveToRow(row),
             terminal::Clear(terminal::ClearType::CurrentLine))?;
 
         queue!(stdout,

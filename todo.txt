@@ -1,0 +1,7 @@
+[] Fast Rendering
+[] Support Wrapping
+[] Better keybinds
+[] Fix mouse click
+[] >= 1000 loc with fast rendering
+
+* [] Insert Mode
