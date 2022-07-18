@@ -9,6 +9,26 @@ use crossterm::event::*;
 /// Wrapper around Result
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+struct EditorState {
+    running: bool,
+    rows: usize,
+    columns: usize,
+    scroll_y: usize,
+}
+
+struct CursorState {
+    cursor: Cursor,
+    last_column: bool,
+    last_padding: usize,
+}
+
+struct RenderState {
+    stdout: Stdout,
+    modif_column: Option<usize>,
+    modif_all: bool,
+    last_cursor: Option<Cursor>
+}
+
 /// Represents the cursor on the terminal screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cursor {
@@ -68,6 +88,64 @@ impl Cursor {
         } else {
             self.column = usize::min(max_col, new_column);
         }
+    }
+
+    /// Adjust the column when a vertical movement issued to be at the 
+    /// begining of the text, taking into account padding.
+    fn adjust_column_start(
+        &mut self,
+        doc: &Document,
+        scroll_y: &mut usize,
+        last_padding: &mut usize
+    ) {
+        // Get a reference to the line the cursor is at on the document
+        let curr_line = 
+            &doc.inner_lines[*scroll_y + self.row];
+
+        // Update the padding
+        let mut curr_padding = 0;
+        while curr_padding < curr_line.len() 
+                && curr_line
+                    .as_bytes()[curr_padding]
+                    .is_ascii_whitespace() {
+            curr_padding += 1;
+        }
+
+        *last_padding = curr_padding;
+
+        // Update the cursor column to the start
+        self.column = curr_padding;
+    }
+
+    /// Adjust the column when a vertical movement issued to be at the 
+    /// end of the line
+    fn adjust_column_end(
+        &mut self,
+        doc: &Document,
+        scroll_y: &mut usize,
+        last_column: &mut bool,
+        last_padding: &mut usize
+    ) {
+        // Get a reference to the line the cursor is at on the document
+        let curr_line = 
+            &doc.inner_lines[*scroll_y + self.row];
+
+        // Update the padding
+        let mut curr_padding = 0;
+        while curr_padding < curr_line.len() 
+                && curr_line
+                    .as_bytes()[curr_padding]
+                    .is_ascii_whitespace() {
+            curr_padding += 1;
+        }
+
+        *last_padding = curr_padding;
+
+        // We want the next left movement to go left
+        *last_column = false;
+
+        // Update the cursor column
+        self.column = curr_line.len().checked_sub(1).unwrap_or(0);
     }
 
     /// Adjust the column when a random movement occurs, mouse for example, it
@@ -158,6 +236,7 @@ impl Cursor {
         }
     }
 
+    /// Move the scroll up by an entire page leaving the cursor on its position
     fn page_up(
         &mut self,
         rows: usize,
@@ -182,6 +261,8 @@ impl Cursor {
         }
     }
 
+    /// Move the scroll down by an entire page leaving the cursor on its 
+    /// position
     fn page_down(
         &mut self,
         rows: usize,
@@ -389,25 +470,24 @@ fn refresh_screen(
 
 // TODO: Use async like a real castellanoleonés
 fn process_keypress(
-    running: &mut bool, 
-    cursor: &mut Cursor,
-    last_column: &mut bool,
-    last_padding: &mut usize,
-    scroll_y: &mut usize,
     doc: &mut Option<Document>,
-    last_cursor: &mut Option<Cursor>,
-    modif_row: &mut Option<usize>,
-    modif_all: &mut bool,
+    editor_state: &mut EditorState,
+    cursor_state: &mut CursorState,
+    render_state: &mut RenderState,
 ) -> Result<()> {
     let mut doc_lines = match doc {
         Some(ref doc) => doc.inner_lines.len(),
         None => 0,
     };
 
-    // Extract the size of the working buffer
+    // Extract the size of the working buffer and update the editor state
     let (columns, rows) = terminal::size()?;
     let rows = (rows - 2) as usize;
     let columns = (columns - 4) as usize;
+    
+    editor_state.rows = rows;
+    editor_state.columns = columns;
+
 
     if let Ok(true) = poll(Duration::from_millis(50)) {
         if let Ok(ref event) = read() {
@@ -527,12 +607,13 @@ fn process_keypress(
 
                             // Adjust the move down on the file to the proper
                             // column
-                            cursor.adjust_column_vertical(
-                                &doc,
-                                *modifiers,
-                                scroll_y,
-                                last_column,
-                                last_padding);
+                            if *scroll_y != doc_lines - rows 
+                                        && cursor.row < rows {
+                                cursor.adjust_column_start(
+                                    &doc,
+                                    scroll_y,
+                                    last_padding);
+                            }
 
                             return Ok(());
                         }
@@ -544,10 +625,10 @@ fn process_keypress(
                                 b' ' => {
                                     let mut new_col = cursor.column;
                                     while new_col <= max_col && 
-                                          curr_line
-                                              .as_bytes()[new_col] 
-                                                    == b' ' {
-                                        new_col += 1;
+                                        curr_line
+                                            .as_bytes()[new_col] 
+                                            == b' ' {
+                                                new_col += 1;
                                     }
 
                                     cursor.column = 
@@ -597,7 +678,7 @@ fn process_keypress(
                     if let Some(doc) = doc {
                         // This applies to all word movements, if at the end of
                         // line just try going to the next
-                        if cursor.column == 0 && cursor.row >= 0 {
+                        if cursor.column == 0 {
                             // Normal move up
                             cursor.move_up(
                                 rows,
@@ -609,12 +690,13 @@ fn process_keypress(
 
                             // Adjust the move down on the file to the proper
                             // column
-                            cursor.adjust_column_vertical(
-                                &doc,
-                                *modifiers,
-                                scroll_y,
-                                last_column,
-                                last_padding);
+                            if cursor.row != 0 {
+                                cursor.adjust_column_end(
+                                    &doc,
+                                    scroll_y,
+                                    last_column,
+                                    last_padding);
+                            }
 
                             return Ok(());
                         }
@@ -823,12 +905,6 @@ fn main() -> Result<()> {
         None
     };
 
-    // Initial position of the cursor
-    let mut cursor = Cursor {
-        column: 0,
-        row: 0
-    };
-
     // Put the terminal in raw mode, which means that:
     //  - The stdin doesn't go the stdout directly, its buffered.
     //  - Any special characters `Ctrl + ...` has no special behaviours.
@@ -844,23 +920,40 @@ fn main() -> Result<()> {
         crossterm::cursor::DisableBlinking,
         EnableMouseCapture)?;
 
+    // Editor state
+    let (columns, rows) = terminal::size()?;
+    let rows = (rows - 2) as usize;
+    let columns = (columns - 4) as usize;
+    let mut editor_state = EditorState {
+        running: true,
+        rows,
+        columns
+    };
 
-    // Variables to update the screen efficiently
-    let mut modif_column = None;
-    let mut modif_all = false;
-    let mut last_cursor = None;
+    // Cursor state needed to calculate movement
+    let mut cursor_state = CursorState {
+        cursor: Cursor {
+            column: 0,
+            row: 0
+        },
+        scroll_y: 0,
+        last_column: false,
+        last_padding = 0,
+    };
 
-    // Editor state needed for movement
-    let mut last_column = false;
-    let mut last_padding = 0;
-    let mut scroll_y = 0;
+    // Render state to update the screen efficiently
+    let mut render_state = RenderState {
+        stdout,
+        modif_column: None,
+        modif_all: false,
+        last_cursor = None;
+    };
 
-    let mut running = true;
     loop {
         // Repaint on the screen what needs to be repainted
-        refresh_screen(&mut stdout, &curr_doc, &cursor, scroll_y)?;
+        refresh_screen(&curr_doc, &mut RenderState, &EditorState)?;
 
-        last_cursor = None;
+        render_state.last_cursor = None;
 
         // Check if the editor should keep running, if it should close it will
         // clear all it drawed
@@ -870,18 +963,12 @@ fn main() -> Result<()> {
 
         // Process events
         process_keypress(
-            &mut running, 
-            &mut cursor,
-            &mut last_column,
-            &mut last_padding,
-            &mut scroll_y,
-            &mut curr_doc,
-            &mut last_cursor,
-            &mut modif_column,
-            &mut modif_all)?;
+            &mut EditorState,
+            &mut CursorState,
+            &mut RenderState)?;
 
-        modif_column = None;
-        modif_all = false;
+        render_state.modif_column = None;
+        render_state.modif_all = false;
     }
 
     // Disable mouse support and because we entered an alternative screen, when
