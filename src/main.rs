@@ -85,9 +85,10 @@ fn main() -> Result<()> {
 
     // Render state to update the screen efficiently
     let mut render_state = RenderState {
-        modif_column: None,
-        modif_all: false,
-        last_cursor: None
+        modif_row: None,
+        modif_all: true,
+        last_cursor: None,
+        modif_status: true,
     };
 
     loop {
@@ -101,6 +102,9 @@ fn main() -> Result<()> {
             &mut render_state)?;
 
         render_state.last_cursor = None;
+        render_state.modif_status = false;
+        render_state.modif_all = false;
+        render_state.modif_row = None;
 
         // Check if the editor should keep running, if it should close it will
         // clear all it drawed
@@ -115,9 +119,6 @@ fn main() -> Result<()> {
             &mut editor_state,
             &mut cursor_state,
             &mut render_state)?;
-
-        render_state.modif_column = None;
-        render_state.modif_all = false;
     }
 
     // Disable mouse support and because we entered an alternative screen, when

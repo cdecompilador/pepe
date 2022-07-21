@@ -1,3 +1,5 @@
+//! Handle all the input and the reaction of the cursor/sroll to it
+
 use std::time::Duration;
 
 use crossterm::terminal;
@@ -6,6 +8,30 @@ use crossterm::event::*;
 use crate::{EditorState, Result};
 use crate::text::Document;
 use crate::render::RenderState;
+
+#[repr(u32)]
+enum BeepType {
+    Simple = 0xFFFFFFFF,
+    Asterisk = 0x00000010,
+}
+
+#[link(name="User32")]
+extern "C" {
+    fn MessageBeep(uType: u32) -> i32;
+}
+
+macro_rules! beep {
+    (0) => {
+        unsafe {
+            MessageBeep(BeepType::Simple as u32);
+        }
+    };
+    (1) => {
+        unsafe {
+            MessageBeep(BeepType::Asterisk as u32);
+        }
+    };
+}
 
 /// The state of the cursor, needed to handle the movements properly
 pub struct CursorState {
@@ -44,6 +70,7 @@ impl Cursor {
         CursorState { last_column, last_padding, scroll_y }: &mut CursorState
     ) {
         // Get a reference to the line the cursor is at on the document
+        assert!(*scroll_y < 134);
         let curr_line = 
             &doc.inner_lines[*scroll_y + self.row];
 
@@ -200,9 +227,10 @@ impl Cursor {
     ) {
         // Special case the cursor is at the bottom of the
         // terminal, scroll if possible
-        if self.row == *rows {
+        if self.row == *rows - 1 {
             if *scroll_y < *doc_lines - *rows {
                 *modif_all = true;
+
                 *scroll_y += 1;
             }
         } else {
@@ -211,6 +239,7 @@ impl Cursor {
                 // Normal move down
                 if self.row < *doc_lines - *scroll_y - 1 {
                     *last_cursor = Some(*self);
+
                     self.row += 1;
                 }
             }
@@ -249,9 +278,11 @@ impl Cursor {
     ) {
         if *scroll_y + *rows <= *doc_lines {
             *modif_all = true;
+
             *scroll_y += *rows;
         } else {
             *last_cursor = Some(*self);
+
             self.row = (doc_lines % rows)
                 .checked_sub(1)
                 .unwrap_or(0);
@@ -264,25 +295,16 @@ impl Cursor {
         CursorState { scroll_y, .. }: &mut CursorState,
         RenderState { modif_all, .. }: &mut RenderState
     ) {
-        // Special case the cursor is at the bottom of the
-        // terminal, scroll if possible
-        if self.row == *rows {
-            if *scroll_y < doc_lines - rows {
+        // Special case of empty file
+        if *scroll_y != 0 || *doc_lines != 0 {
+            // Normal scroll down
+            if self.row < doc_lines - *scroll_y - 1 {
                 *modif_all = true;
-                *scroll_y += 1;
-                self.row -= 1;
-            }
-        } else {
-            // Special case of empty file
-            if *scroll_y != 0 || *doc_lines != 0 {
-                // Normal move down
-                if self.row < doc_lines - *scroll_y - 1 {
-                    *scroll_y += 1;
-                    if self.row != 0 {
-                        self.row -= 1;
-                    }
-                }
 
+                *scroll_y += 1;
+                if self.row != 0 {
+                    self.row -= 1;
+                }
             }
         }
     }
@@ -296,6 +318,7 @@ impl Cursor {
         // Special case cursor at the top of the terminal, so
         // try to scroll (if possible)
         if self.row == 0 {
+            beep!(1);
             if *scroll_y > 0 {
                 *modif_all = true;
 
@@ -304,13 +327,20 @@ impl Cursor {
             }
 
         // Normal up
-        } else if *scroll_y > 0 {
+        } else if *scroll_y >= 0 {
             *modif_all = true;
+            
 
             *scroll_y -= 1;
-            if self.row != *rows {
+            if self.row != *rows - 1 {
                 self.row += 1;
-            }
+            }  
+        } else {
+            /*
+            beep!(0);
+            dbg!(scroll_y);
+            panic!();
+            */
         }
     }
 }
@@ -521,6 +551,8 @@ pub fn process_keypress(
                                         cursor_state.scroll_y - 1 {
                             return Ok(());
                         }
+
+                        render_state.last_cursor = Some(*cursor);
 
                         // Simple word movement (until next whitespace)
                         if modifiers.contains(KeyModifiers::CONTROL) {

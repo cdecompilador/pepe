@@ -1,3 +1,6 @@
+//! All primitives related to rendering to the screen, the phylosophy is to
+//! only redraw what needs to be readrawn and NOT in loop, event model
+
 use std::io::{Write, Stdout};
 
 use crossterm::{queue, execute, terminal};
@@ -9,14 +12,17 @@ use crate::text::Document;
 
 /// Settings used to do the rendering on a optimized way
 pub struct RenderState {
-    /// Columns that needs to be repainted
-    pub modif_column: Option<usize>,
+    /// Row that needs to be repainted
+    pub modif_row: Option<usize>,
 
     /// If all the terminal needs to be repainted
     pub modif_all: bool,
 
     /// The position of the cursor, if `Some`, used to update the cursor 
-    pub last_cursor: Option<Cursor>
+    pub last_cursor: Option<Cursor>,
+
+    /// If the status bar needs to be repainted
+    pub modif_status: bool
 }
 
 /// Update (if needed) the elements that need to be updated on the screen
@@ -26,50 +32,136 @@ pub fn refresh_screen(
     cursor: &Cursor,
     EditorState { rows, columns, .. }: &EditorState,
     CursorState { scroll_y, .. }: &CursorState,
-    _: &RenderState
+    RenderState { 
+        modif_row, 
+        modif_all, 
+        last_cursor, 
+        modif_status 
+    }: &RenderState
 ) -> Result<()> {
-    // Hide the cursor
-    execute!(stdout, crossterm::cursor::Hide)?;
-
-    // Re-draw all the rows
-    for row in 0..(*rows - 1) as u16 {
-        // Clear this line
-        queue!(stdout, 
-            crossterm::cursor::MoveToRow(row),
-            terminal::Clear(terminal::ClearType::CurrentLine))?;
-
+    // Check if the status bar needs to be repainted
+    if *modif_status {
         queue!(stdout,
-            crossterm::cursor::MoveTo(0, row),
-            Print("~ "
-                .with(Color::Yellow)))?;
-
-        // Print the document
-        if let Some(doc) = document {
-            if let Some(line) = &doc.inner_lines.get(row as usize + scroll_y) {
-                queue!(stdout,
-                    crossterm::cursor::MoveTo(0, row),
-                    PrintStyledContent(format!("{:3} ", row as usize + scroll_y)
-                        .with(Color::Yellow)),
-                    Print(line))?;
-            }
-        } else {
-            // Print the intro (no document opened)
-            if row == *rows as u16 / 3 {
-                let msg = "Pepe editor -- version 0.0.1"
-                    .with(Color::Blue);
-                let msg_start = *columns / 2 - msg.content().len() / 2;
-
-                queue!(stdout,
-                    crossterm::cursor::MoveTo(msg_start as u16, row),
-                    PrintStyledContent(msg))?;
-            }
-        }
+            crossterm::cursor::SavePosition,
+            crossterm::cursor::MoveTo(0, *rows as u16),
+            PrintStyledContent(
+                render_status_bar(
+                    document, 
+                    cursor, 
+                    *columns, 
+                    *scroll_y)
+                .with(Color::Black)
+                .on(Color::White)),
+            crossterm::cursor::RestorePosition)?;
     }
 
-    // Print the status bar
-    //
-    // TODO: Modifications in-place of the `status_msg` might improve perf
-    let mut status_msg = String::with_capacity(*columns);
+    // Re-draw all the rows when modif_all
+    if *modif_all {
+        // Print the document lines
+        if let Some(doc) = document {
+            // Hide the cursor
+            queue!(stdout, 
+                crossterm::cursor::MoveTo(
+                    cursor.column as u16 + 4, cursor.row as u16),
+                crossterm::cursor::SavePosition,
+                crossterm::cursor::Hide)?;
+
+            for row in 0..*rows as u16 {
+                // Clear this line
+                queue!(stdout, 
+                    crossterm::cursor::MoveToRow(row),
+                    terminal::Clear(terminal::ClearType::CurrentLine))?;
+
+                let idx = row as usize + scroll_y;
+                if let Some(line) = &doc.inner_lines.get(idx) {
+                    // Print the document
+                    queue!(stdout,
+                        crossterm::cursor::MoveTo(0, row),
+                        PrintStyledContent(
+                            format!("{:3} ", idx)
+                                .with(Color::Yellow)),
+                        Print(line))?;
+                } else {
+                    queue!(stdout,
+                        crossterm::cursor::MoveTo(0, row),
+                        Print("~ "
+                            .with(Color::Yellow)))?;
+                }
+            }
+
+            // Show again the cursor
+            queue!(stdout, 
+                crossterm::cursor::RestorePosition,
+                crossterm::cursor::Show)?;
+
+        // No file loaded so this is the first print of logo screen
+        } else {
+            for row in 0..(*rows - 1) as u16 {
+                // Clear this line
+                queue!(stdout, 
+                    crossterm::cursor::MoveToRow(row),
+                    terminal::Clear(terminal::ClearType::CurrentLine))?;
+
+                // Print the intro (no document opened)
+                if row == *rows as u16 / 3 {
+                    let msg = "Pepe editor -- version 0.0.1"
+                        .with(Color::Blue);
+                    let msg_start = *columns / 2 - msg.content().len() / 2;
+
+                    queue!(stdout,
+                        crossterm::cursor::MoveTo(0, row),
+                        Print("~ "
+                            .with(Color::Yellow)),
+                        crossterm::cursor::MoveTo(msg_start as u16, row),
+                        PrintStyledContent(msg))?;
+                } else {
+                    queue!(stdout,
+                        crossterm::cursor::MoveTo(0, row),
+                        Print("~ "
+                            .with(Color::Yellow)))?;
+                }
+            }
+        }
+    } else if let Some(row) = modif_row {
+        let idx = row + scroll_y;
+        let line = &document.as_ref().unwrap().inner_lines[idx];
+
+        queue!(stdout,
+            crossterm::cursor::SavePosition,
+            crossterm::cursor::MoveTo(0, *row as u16),
+            PrintStyledContent(
+                format!("{:3} ", idx)
+                    .with(Color::Yellow)),
+            Print(line),
+            crossterm::cursor::RestorePosition)?
+    }
+
+    if last_cursor.is_some() && *modif_all == false {
+        let last_cursor = last_cursor.unwrap();
+
+        queue!(stdout, 
+            crossterm::cursor::Hide,
+            crossterm::cursor::MoveTo(
+                cursor.column as u16 + 4, cursor.row as u16),
+            crossterm::cursor::Show)?;
+    }
+
+    // Send all the draw commands at once
+    stdout.flush()?;
+
+    Ok(())
+}
+
+/// Print the status bar
+///
+/// TODO: Modifications in-place of the `status_msg` might improve perf
+fn render_status_bar(
+    document: &Option<Document>, 
+    cursor: &Cursor,
+    columns: usize,
+    scroll_y: usize
+) -> String {
+    let mut status_msg = String::with_capacity(columns);
     if let Some(doc) = document {
         // Insert the path and a couple whitespaces, not sure if the conversion
         // from path -> str can really fail
@@ -104,19 +196,6 @@ pub fn refresh_screen(
             status_msg.push(' ');
         }
     }
-    queue!(stdout,
-        crossterm::cursor::MoveToNextLine(1),
-        PrintStyledContent(status_msg
-            .with(Color::Black)
-            .on(Color::White)))?;
 
-    // Show again the cursor
-    queue!(stdout, 
-        crossterm::cursor::MoveTo(cursor.column as u16 + 4, cursor.row as u16),
-        crossterm::cursor::Show)?;
-
-    // Send all the draw commands at once
-    stdout.flush()?;
-
-    Ok(())
+    status_msg
 }

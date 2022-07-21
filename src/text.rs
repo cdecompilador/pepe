@@ -1,3 +1,6 @@
+//! All text processing/loading/storing related thing, on the future syntax
+//! highlighting will be handled here
+
 use std::path::{Path, PathBuf};
 
 use crate::Result;
